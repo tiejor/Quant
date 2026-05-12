@@ -47,6 +47,14 @@ def _next_trading_day(date: pd.Timestamp, trading_days: pd.DatetimeIndex) -> pd.
     return candidates[0]
 
 
+def _nth_trading_day_after(date: pd.Timestamp, trading_days: pd.DatetimeIndex, n: int = 0) -> pd.Timestamp | None:
+    """返回 date 之后第 n 个交易日（n=0 为第一个下一个交易日），无则返回 None"""
+    candidates = trading_days[trading_days > date]
+    if len(candidates) <= n:
+        return None
+    return candidates[n]
+
+
 # ============================================================
 # 因子预处理
 # ============================================================
@@ -139,6 +147,8 @@ def run_backtest(
     factor_name: str,
     n_groups: int = 10,
     standardize: bool = True,
+    offset: int = 0,
+    silent: bool = False,
 ) -> dict:
     """
     月频截面回测。
@@ -164,9 +174,10 @@ def run_backtest(
     # 每月最后一个交易日 = 因子计算日
     factor_dates = _last_trading_day_of_month(all_days)
 
-    print(f"[backtest] 回测区间: {all_days[0].strftime('%Y%m%d')} ~ {all_days[-1].strftime('%Y%m%d')}")
-    print(f"[backtest] 交易天数: {len(all_days)}，月数: {len(factor_dates)}")
-    print(f"[backtest] 因子: {factor_name}，分组数: {n_groups}，标准化: {standardize}")
+    if not silent:
+        print(f"[backtest] 回测区间: {all_days[0].strftime('%Y%m%d')} ~ {all_days[-1].strftime('%Y%m%d')}")
+        print(f"[backtest] 交易天数: {len(all_days)}，月数: {len(factor_dates)}，偏移: {offset}")
+        print(f"[backtest] 因子: {factor_name}，分组数: {n_groups}，标准化: {standardize}")
 
     # 存储各组 + 多空每日收益率
     daily_records = []  # [{trade_date, group_1, ..., group_N, long_short}]
@@ -175,8 +186,8 @@ def run_backtest(
     for i, fc_date in enumerate(factor_dates):
         fc_str = fc_date.strftime("%Y%m%d")
 
-        # 调仓日 = 因子计算日之后的下一个交易日
-        rebalance_date = _next_trading_day(fc_date, all_days)
+        # 调仓日 = 因子计算日之后第 offset 个交易日（offset=0 即下一个交易日）
+        rebalance_date = _nth_trading_day_after(fc_date, all_days, offset)
         if rebalance_date is None:
             continue
 
@@ -198,7 +209,8 @@ def run_backtest(
         # 股票池（调仓日更新）
         universe = filter_universe(fc_str)  # 因子计算日用 stock_st 状态
         if len(universe) < n_groups * 2:
-            print(f"  [{fc_str}] 股票池太小 ({len(universe)} 只)，跳过此月")
+            if not silent:
+                print(f"  [{fc_str}] 股票池太小 ({len(universe)} 只)，跳过此月")
             continue
 
         # 加载因子计算日的截面数据
@@ -254,8 +266,56 @@ def run_backtest(
     # 累计净值
     nav = (1 + gr).cumprod()
 
-    print(f"[backtest] 回测完成，{len(gr)} 个交易日，{len(factor_dates)} 次调仓")
+    if not silent:
+        print(f"[backtest] 回测完成，{len(gr)} 个交易记录（含 {len(factor_dates)} 次调仓）")
     return {
         "group_returns": gr,
         "group_nav": nav,
     }
+
+
+# ============================================================
+# 多轨道偏移
+# ============================================================
+def run_pathways(
+    start_date: str,
+    end_date: str,
+    factor_name: str,
+    n_pathways: int = 5,
+    n_groups: int = 10,
+    standardize: bool = True,
+) -> list[dict]:
+    """
+    多轨道回测：对调仓日偏移 0, 1, ..., n_pathways-1 个交易日，每条轨道独立回测。
+
+    参数：
+        start_date, end_date, factor_name, n_groups, standardize: 同 run_backtest
+        n_pathways: 轨道数（含基准轨道 k=0）
+
+    返回：
+        [{pathway, group_returns, group_nav}, ...] 按偏移量排序
+    """
+    results = []
+    for k in range(n_pathways):
+        print(f"\n[pathway] 轨道 k={k} / {n_pathways - 1}")
+        try:
+            res = run_backtest(
+                start_date=start_date,
+                end_date=end_date,
+                factor_name=factor_name,
+                n_groups=n_groups,
+                standardize=standardize,
+                offset=k,
+                silent=(k > 0),  # 基准轨道打印日志，其余静默
+            )
+            res["pathway"] = k
+            results.append(res)
+        except Exception as e:
+            print(f"  [pathway k={k}] 失败: {e}")
+
+    if not results:
+        raise RuntimeError("所有轨道均回测失败")
+
+    print(f"\n[pathway] 完成 {len(results)}/{n_pathways} 条轨道")
+    return results
+

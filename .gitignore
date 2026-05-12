@@ -1,0 +1,31 @@
+# 数据文件 — DuckDB 是大二进制，由 pipeline.py 重新生成，不入库
+data/*.duckdb
+data/*.db
+
+# 输出产物 — 图表由 evaluate.py 重新生成
+output/*.png
+output/*.pdf
+
+# 敏感信息
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

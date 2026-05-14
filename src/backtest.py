@@ -11,17 +11,17 @@ from src.factors import get_factor
 DB_PATH = "data/quant.duckdb"
 
 
-def _get_db():
+def _get_db(db_path: str | None = None):
     """获取 DuckDB 只读连接"""
-    return duckdb.connect(DB_PATH, read_only=True)
+    return duckdb.connect(db_path or DB_PATH, read_only=True)
 
 
 # ============================================================
 # 交易日工具
 # ============================================================
-def _get_trading_days(start_date: str, end_date: str) -> pd.DatetimeIndex:
+def _get_trading_days(start_date: str, end_date: str, db_path: str | None = None) -> pd.DatetimeIndex:
     """获取回测区间内的交易日序列"""
-    db = _get_db()
+    db = _get_db(db_path)
     df = db.execute(
         "SELECT cal_date FROM trade_cal WHERE is_open=1 AND cal_date BETWEEN ? AND ? ORDER BY cal_date",
         [start_date, end_date]
@@ -84,30 +84,31 @@ def assign_groups(factor_values: pd.Series, n_groups: int) -> pd.Series:
     if len(valid) == 0:
         return pd.Series(dtype=int)
 
-    # qcut：按分位数等分
+    # qcut 按分位数等分，默认将最小值放入第 1 个 bin。
+    # 将因子值取反后，高因子值 → 更小的 bin → 更小的 group 编号。
+    neg = -valid
     labels = list(range(1, n_groups + 1))  # group 1 = highest factor
     try:
-        groups = pd.qcut(valid, q=n_groups, labels=labels)
+        groups = pd.qcut(neg, q=n_groups, labels=labels)
     except ValueError:
-        # qcut 失败（如分位数重复），用 rank 分组
         groups = pd.Series(
-            pd.cut(valid.rank(method="first"), bins=n_groups, labels=labels).values,
+            pd.cut(neg.rank(method="first"), bins=n_groups, labels=labels).values,
             index=valid.index
         )
-    return groups.sort_values(ascending=False)  # 高因子值在前
+    return groups.sort_values(ascending=True)
 
 
 # ============================================================
 # 数据加载
 # ============================================================
-def _load_daily_returns(ts_codes: list[str], date: str) -> pd.Series:
+def _load_daily_returns(ts_codes: list[str], date: str, db_path: str | None = None) -> pd.Series:
     """
     加载指定日期的股票日收益率。
     返回 Series，index=ts_code，值=日收益率（小数）
     """
     if len(ts_codes) == 0:
         return pd.Series(dtype=float)
-    db = _get_db()
+    db = _get_db(db_path)
     placeholders = ",".join(["?"] * len(ts_codes))
     df = db.execute(
         f"SELECT ts_code, pct_chg FROM daily WHERE trade_date=? AND ts_code IN ({placeholders})",
@@ -120,14 +121,14 @@ def _load_daily_returns(ts_codes: list[str], date: str) -> pd.Series:
     return df.set_index("ts_code")["return"]
 
 
-def _load_factor_data(date: str, ts_codes: list[str]) -> pd.DataFrame:
+def _load_factor_data(date: str, ts_codes: list[str], db_path: str | None = None) -> pd.DataFrame:
     """
     加载指定日期的截面数据，用于计算因子。
     返回 DataFrame，index=ts_code，含 pb, total_mv, circ_mv, turnover_rate 列。
     """
     if len(ts_codes) == 0:
         return pd.DataFrame()
-    db = _get_db()
+    db = _get_db(db_path)
     placeholders = ",".join(["?"] * len(ts_codes))
     df = db.execute(
         f"SELECT ts_code, pb, total_mv, circ_mv, turnover_rate FROM daily_basic "
@@ -149,6 +150,7 @@ def run_backtest(
     standardize: bool = True,
     offset: int = 0,
     silent: bool = False,
+    db_path: str | None = None,
 ) -> dict:
     """
     月频截面回测。
@@ -159,6 +161,7 @@ def run_backtest(
         factor_name: 因子名称（factors.py FACTOR_REGISTRY 中的 key）
         n_groups:    分组数（默认 10）
         standardize: 是否做截面 MAD 标准化（默认 True）
+        db_path:     数据库路径（默认使用 data/quant.duckdb）
 
     返回字典：
         group_returns:  DataFrame，每列为一组 + long_short 的日度收益率
@@ -167,7 +170,7 @@ def run_backtest(
     factor_fn = get_factor(factor_name)
 
     # 获取交易日序列
-    all_days = _get_trading_days(start_date, end_date)
+    all_days = _get_trading_days(start_date, end_date, db_path=db_path)
     if len(all_days) == 0:
         raise ValueError(f"区间 {start_date}~{end_date} 无交易日")
 
@@ -181,6 +184,10 @@ def run_backtest(
 
     # 存储各组 + 多空每日收益率
     daily_records = []  # [{trade_date, group_1, ..., group_N, long_short}]
+
+    # IC 评估数据
+    factor_values_list = []  # [(date_str, Series)]
+    forward_returns_list = []  # [Series]
 
     # 逐月回测
     for i, fc_date in enumerate(factor_dates):
@@ -207,14 +214,14 @@ def run_backtest(
             hold_end = all_days[-1]
 
         # 股票池（调仓日更新）
-        universe = filter_universe(fc_str)  # 因子计算日用 stock_st 状态
+        universe = filter_universe(fc_str, db_path=db_path)
         if len(universe) < n_groups * 2:
             if not silent:
                 print(f"  [{fc_str}] 股票池太小 ({len(universe)} 只)，跳过此月")
             continue
 
         # 加载因子计算日的截面数据
-        fac_data = _load_factor_data(fc_str, universe)
+        fac_data = _load_factor_data(fc_str, universe, db_path=db_path)
         if fac_data.empty:
             print(f"  [{fc_str}] 无因子数据，跳过")
             continue
@@ -230,17 +237,26 @@ def run_backtest(
         if standardize:
             factor_values = mad_standardize(factor_values)
 
+        # 保存因子值（IC 评估用）
+        factor_values_list.append((fc_str, factor_values.copy()))
+
         # 分组
         groups = assign_groups(factor_values, n_groups)
 
         # 持仓期内逐日追踪
         hold_days = all_days[(all_days >= rebalance_date) & (all_days <= hold_end)]
+        stock_returns = {}  # ts_code → list of daily returns
         for day in hold_days:
             day_str = day.strftime("%Y%m%d")
             # 加载该日所有分组内股票的收益率
-            rets = _load_daily_returns(list(groups.index), day_str)
+            rets = _load_daily_returns(list(groups.index), day_str, db_path=db_path)
             if rets.empty:
                 continue
+
+            for ts_code, ret_val in rets.items():
+                if ts_code not in stock_returns:
+                    stock_returns[ts_code] = []
+                stock_returns[ts_code].append(ret_val)
 
             record = {"trade_date": day_str}
             for grp in range(1, n_groups + 1):
@@ -254,6 +270,17 @@ def run_backtest(
             # 多空：G1 - GN
             record["long_short"] = record.get(f"group_1", 0.0) - record.get(f"group_{n_groups}", 0.0)
             daily_records.append(record)
+
+        # 前向收益：每只股票在持仓期内的累计收益
+        if stock_returns:
+            fwd = pd.Series({
+                c: (np.prod([1 + r for r in rets]) - 1)
+                for c, rets in stock_returns.items()
+            })
+            fwd.name = fc_str
+            forward_returns_list.append(fwd)
+        else:
+            forward_returns_list.append(pd.Series(dtype=float))
 
     # 汇总结果
     gr = pd.DataFrame(daily_records).set_index("trade_date")
@@ -271,6 +298,8 @@ def run_backtest(
     return {
         "group_returns": gr,
         "group_nav": nav,
+        "factor_values": factor_values_list,
+        "forward_returns": forward_returns_list,
     }
 
 

@@ -20,6 +20,8 @@ from src.evaluate import (
     plot_group_nav,
     plot_ic_timeline,
     plot_ic_decay,
+    compute_ic_series,
+    evaluate_ic,
 )
 
 DB_PATH = "data/quant.duckdb"
@@ -100,8 +102,23 @@ def main():
 
     # 出图
     plot_group_nav(nav, args.factor)
-    # IC 时序图用临时的简单占位（真实场景需从回测中保存因子值和收益）
-    # 绩效 IC/IR 评估由 evaluate 模块独立提供接口
+
+    # IC 评估
+    fv = base.get("factor_values", [])
+    fwd = base.get("forward_returns", [])
+    if fv and fwd:
+        fv_series = [s for _, s in fv]
+        ic = compute_ic_series(fv_series, fwd)
+        ic_metrics = evaluate_ic(ic)
+        print(f"\n基准轨道 IC 评估:")
+        print(f"  IC 均值: {ic_metrics['ic_mean']:.4f}")
+        print(f"  IR:      {ic_metrics['ic_ir']:.4f}")
+        print(f"  t 值:    {ic_metrics['t_stat']:.2f}  (p={ic_metrics['p_value']:.4f})")
+        print(f"  半衰期:  {ic_metrics['half_life']} 期")
+        print(f"  期数:    {ic_metrics['n_periods']}")
+
+        plot_ic_timeline(ic, args.factor)
+        plot_ic_decay(ic, args.factor)
 
     # 多轨道汇总
     print(f"\n多轨道汇总（{len(pathways)} 条轨道）:")

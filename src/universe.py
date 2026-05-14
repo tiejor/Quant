@@ -9,12 +9,12 @@ import duckdb
 DB_PATH = "data/quant.duckdb"
 
 
-def _get_db():
+def _get_db(db_path: str | None = None):
     """获取 DuckDB 只读连接"""
-    return duckdb.connect(DB_PATH, read_only=True)
+    return duckdb.connect(db_path or DB_PATH, read_only=True)
 
 
-def filter_universe(trade_date: str) -> list[str]:
+def filter_universe(trade_date: str, db_path: str | None = None) -> list[str]:
     """
     返回指定调仓日有资格进入分组的股票代码列表。
     过滤规则：
@@ -22,7 +22,7 @@ def filter_universe(trade_date: str) -> list[str]:
       2. 排除上市不足 365 天的新股（list_date 早于 trade_date 至少 365 天）
     停牌不做剔除。
     """
-    db = _get_db()
+    db = _get_db(db_path)
 
     # 当日 ST 列表
     st_codes = set(

@@ -19,8 +19,10 @@ def pb_factor(data: pd.DataFrame) -> pd.Series:
     """
     pb = data["pb"].copy()
     pb = pb.replace([np.inf, -np.inf], np.nan)
-    pb = pb[pb > 0]
-    return 1.0 / pb
+    result = pd.Series(np.nan, index=pb.index)
+    valid = pb > 0
+    result.loc[valid] = 1.0 / pb.loc[valid]
+    return result
 
 
 def size_factor(data: pd.DataFrame) -> pd.Series:
@@ -32,8 +34,10 @@ def size_factor(data: pd.DataFrame) -> pd.Series:
     """
     mv = data["circ_mv"].copy()
     mv = mv.replace([np.inf, -np.inf], np.nan)
-    mv = mv[mv > 0]
-    return -np.log(mv)
+    result = pd.Series(np.nan, index=mv.index)
+    valid = mv > 0
+    result.loc[valid] = -np.log(mv.loc[valid])
+    return result
 
 
 def turnover_factor(data: pd.DataFrame) -> pd.Series:
@@ -44,7 +48,9 @@ def turnover_factor(data: pd.DataFrame) -> pd.Series:
     """
     turnover = data["turnover_rate"].copy()
     turnover = turnover.replace([np.inf, -np.inf], np.nan)
-    return -turnover
+    result = -turnover
+    result.name = None
+    return result
 
 
 # 因子注册表：因子名 → 因子函数
@@ -56,7 +62,8 @@ FACTOR_REGISTRY = {
 
 
 def get_factor(name: str):
-    """根据名称获取因子函数"""
-    if name not in FACTOR_REGISTRY:
+    """根据名称获取因子函数（大小写不敏感）"""
+    name_lower = name.lower()
+    if name_lower not in FACTOR_REGISTRY:
         raise ValueError(f"未知因子: {name}，可用: {list(FACTOR_REGISTRY.keys())}")
-    return FACTOR_REGISTRY[name]
+    return FACTOR_REGISTRY[name_lower]

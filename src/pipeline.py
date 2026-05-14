@@ -6,10 +6,12 @@
 
 import os
 import time
+import threading
 import duckdb
 import pandas as pd
 import tushare as ts
 from joblib import Parallel, delayed
+from tqdm import tqdm
 
 # ============================================================
 # 配置
@@ -20,32 +22,35 @@ RETRY_SLEEP = 15     # 命中频率限制后的休眠秒数
 
 # Tushare 懒加载（实际调用时才检查 token）
 _pro = None
+_pro_lock = threading.Lock()
 
 def _get_pro():
-    """获取 Tushare pro 接口（懒加载 token）"""
+    """获取 Tushare pro 接口（懒加载 token，线程安全）"""
     global _pro
     if _pro is None:
-        token = os.getenv("TUSHARE_TOKEN")
-        if not token:
-            raise RuntimeError("未找到 TUSHARE_TOKEN 环境变量，请先设置: export TUSHARE_TOKEN=your_token")
-        _pro = ts.pro_api(token)
+        with _pro_lock:
+            if _pro is None:
+                token = os.getenv("TUSHARE_TOKEN")
+                if not token:
+                    raise RuntimeError("未找到 TUSHARE_TOKEN 环境变量，请先设置: export TUSHARE_TOKEN=your_token")
+                _pro = ts.pro_api(token)
     return _pro
 
 
 # ============================================================
 # DuckDB 连接
 # ============================================================
-def get_db():
+def get_db(db_path=None):
     """获取 DuckDB 连接"""
-    return duckdb.connect(DB_PATH)
+    return duckdb.connect(db_path or DB_PATH)
 
 
 # ============================================================
 # 建表
 # ============================================================
-def init_tables():
+def init_tables(db_path=None):
     """初始化所有数据表（不存在则创建）"""
-    db = get_db()
+    db = get_db(db_path)
     db.execute("""
         CREATE TABLE IF NOT EXISTS stock_basic (
             ts_code     TEXT PRIMARY KEY,
@@ -135,7 +140,7 @@ def _fetch_with_retry(fetch_fn, label: str, max_retries=MAX_RETRIES, sleep_sec=R
 # ============================================================
 # 串行拉取：小数据表
 # ============================================================
-def pull_stock_basic():
+def pull_stock_basic(db_path=None):
     """拉取 A 股基础信息（全量，一次调用）"""
     print("[stock_basic] 拉取中...")
 
@@ -153,14 +158,14 @@ def pull_stock_basic():
     if df is None:
         return
 
-    db = get_db()
+    db = get_db(db_path)
     db.execute("DELETE FROM stock_basic")  # 基础信息全量覆盖
     db.execute("INSERT INTO stock_basic SELECT * FROM df")
     db.close()
     print(f"[stock_basic] 完成，{len(df)} 条")
 
 
-def pull_trade_cal(start_date, end_date):
+def pull_trade_cal(start_date, end_date, db_path=None):
     """拉取交易日历"""
     print(f"[trade_cal] {start_date}~{end_date}...")
 
@@ -180,7 +185,7 @@ def pull_trade_cal(start_date, end_date):
     if df is None:
         return
 
-    db = get_db()
+    db = get_db(db_path)
     db.execute("INSERT OR IGNORE INTO trade_cal SELECT * FROM df")
     db.close()
     print(f"[trade_cal] 完成，{len(df)} 条")
@@ -220,101 +225,158 @@ def pull_stock_st(start_date, end_date):
         print("[stock_st] 无数据")
 
 
+def _get_trading_days_in_range(start_date, end_date, db_path=None):
+    """获取区间内的交易日列表（is_open=1），按日期升序."""
+    db = get_db(db_path)
+    df = db.execute(
+        "SELECT cal_date FROM trade_cal WHERE is_open=1 AND cal_date BETWEEN ? AND ? ORDER BY cal_date",
+        [start_date, end_date],
+    ).df()
+    db.close()
+    return df["cal_date"].tolist() if not df.empty else []
+
+
 # ============================================================
 # 并行拉取：大数据表
 # ============================================================
-def _fetch_daily_year(year: int) -> pd.DataFrame | None:
-    """拉取单年的日线行情（供 joblib 并行调用）"""
-    s = f"{year}0101"
-    e = f"{year}1231"
-    label = f"daily/{year}"
+def _fetch_one_daily_day(date: str):
+    """拉取单个交易日的日线行情，返回 (date, df_or_None)."""
+    label = f"daily/{date}"
 
-    def _do():
+    def _do(d=date):
         df = _get_pro().daily(
-            start_date=s,
-            end_date=e,
+            trade_date=d,
             fields="ts_code,trade_date,open,high,low,close,pre_close,pct_chg,vol,amount"
         )
         return df
 
-    result = _fetch_with_retry(_do, label)
-    if result is not None and len(result) > 0:
-        print(f"  [daily/{year}] {len(result)} 条")
-    return result
+    df = _fetch_with_retry(_do, label)
+    return date, df
 
 
-def _fetch_daily_basic_year(year: int) -> pd.DataFrame | None:
-    """拉取单年的每日基本面指标（供 joblib 并行调用）"""
-    s = f"{year}0101"
-    e = f"{year}1231"
-    label = f"daily_basic/{year}"
+def _fetch_one_daily_basic_day(date: str):
+    """拉取单个交易日的基本面指标，返回 (date, df_or_None)."""
+    label = f"daily_basic/{date}"
 
-    def _do():
+    def _do(d=date):
         df = _get_pro().daily_basic(
-            start_date=s,
-            end_date=e,
+            trade_date=d,
             fields="ts_code,trade_date,pb,total_mv,circ_mv,turnover_rate"
         )
         return df
 
-    result = _fetch_with_retry(_do, label)
-    if result is not None and len(result) > 0:
-        print(f"  [daily_basic/{year}] {len(result)} 条")
-    return result
+    df = _fetch_with_retry(_do, label)
+    return date, df
 
 
-def pull_daily(start_date, end_date):
-    """拉取日线行情：按年拆任务，joblib 并行下载"""
+def pull_daily(start_date, end_date, db_path=None):
+    """拉取日线行情：年串行，年内交易日并行，全局进度条."""
     start_yr = int(start_date[:4])
     end_yr = int(end_date[:4])
     years = list(range(start_yr, end_yr + 1))
-    print(f"[daily] 并行拉取 {len(years)} 年: {start_yr}~{end_yr} (n_jobs=-2)...")
 
-    results = Parallel(n_jobs=-2, prefer="threads")(
-        delayed(_fetch_daily_year)(y) for y in years
-    )
+    # 预计算总交易日数
+    total_days = 0
+    for y in years:
+        s = f"{y}0101"
+        e = f"{y}1231"
+        total_days += len(_get_trading_days_in_range(s, e, db_path=db_path))
 
-    # 合并写入 DuckDB
-    valid = [r for r in results if r is not None and len(r) > 0]
-    if valid:
-        merged = pd.concat(valid, ignore_index=True)
-        db = get_db()
-        db.execute("INSERT OR IGNORE INTO daily SELECT * FROM merged")
-        db.close()
-        print(f"[daily] 完成，共 {len(merged)} 条")
-    else:
-        print("[daily] 无数据")
+    print(f"[daily] {start_yr}~{end_yr} ({len(years)} 年, ~{total_days} 交易日, n_jobs=-1)")
+
+    pbar = tqdm(total=total_days, desc="[daily]", unit="day")
+
+    for y in years:
+        s = f"{y}0101"
+        e = f"{y}1231"
+        trading_days = _get_trading_days_in_range(s, e, db_path=db_path)
+        if not trading_days:
+            print(f"  [{y}] 无交易日，跳过")
+            continue
+
+        def _task(d):
+            result = _fetch_one_daily_day(d)
+            pbar.update(1)
+            return result
+
+        results = Parallel(n_jobs=-1, prefer="threads")(
+            delayed(_task)(d) for d in trading_days
+        )
+
+        valid = [(date, df) for date, df in results if df is not None and len(df) > 0]
+        missing = [date for date, df in results if df is None or len(df) == 0]
+
+        if valid:
+            merged = pd.concat([df for _, df in valid], ignore_index=True)
+            db = get_db(db_path)
+            db.execute("INSERT OR IGNORE INTO daily SELECT * FROM merged")
+            db.close()
+            print(f"  [{y}] {len(valid)}/{len(trading_days)} 天, {len(merged)} 条")
+
+        if missing:
+            print(f"  [!] {y} 缺失 {len(missing)} 天: {', '.join(missing)}")
+
+    pbar.close()
+    print("[daily] 完成")
 
 
-def pull_daily_basic(start_date, end_date):
-    """拉取每日基本面指标：按年拆任务，joblib 并行下载"""
+def pull_daily_basic(start_date, end_date, db_path=None):
+    """拉取每日基本面指标：年串行，年内交易日并行，全局进度条."""
     start_yr = int(start_date[:4])
     end_yr = int(end_date[:4])
     years = list(range(start_yr, end_yr + 1))
-    print(f"[daily_basic] 并行拉取 {len(years)} 年: {start_yr}~{end_yr} (n_jobs=-2)...")
 
-    results = Parallel(n_jobs=-2, prefer="threads")(
-        delayed(_fetch_daily_basic_year)(y) for y in years
-    )
+    total_days = 0
+    for y in years:
+        s = f"{y}0101"
+        e = f"{y}1231"
+        total_days += len(_get_trading_days_in_range(s, e, db_path=db_path))
 
-    valid = [r for r in results if r is not None and len(r) > 0]
-    if valid:
-        merged = pd.concat(valid, ignore_index=True)
-        db = get_db()
-        db.execute("INSERT OR IGNORE INTO daily_basic SELECT * FROM merged")
-        db.close()
-        print(f"[daily_basic] 完成，共 {len(merged)} 条")
-    else:
-        print("[daily_basic] 无数据")
+    print(f"[daily_basic] {start_yr}~{end_yr} ({len(years)} 年, ~{total_days} 交易日, n_jobs=-1)")
+
+    pbar = tqdm(total=total_days, desc="[daily_basic]", unit="day")
+
+    for y in years:
+        s = f"{y}0101"
+        e = f"{y}1231"
+        trading_days = _get_trading_days_in_range(s, e, db_path=db_path)
+        if not trading_days:
+            print(f"  [{y}] 无交易日，跳过")
+            continue
+
+        def _task(d):
+            result = _fetch_one_daily_basic_day(d)
+            pbar.update(1)
+            return result
+
+        results = Parallel(n_jobs=-1, prefer="threads")(
+            delayed(_task)(d) for d in trading_days
+        )
+
+        valid = [(date, df) for date, df in results if df is not None and len(df) > 0]
+        missing = [date for date, df in results if df is None or len(df) == 0]
+
+        if valid:
+            merged = pd.concat([df for _, df in valid], ignore_index=True)
+            db = get_db(db_path)
+            db.execute("INSERT OR IGNORE INTO daily_basic SELECT * FROM merged")
+            db.close()
+            print(f"  [{y}] {len(valid)}/{len(trading_days)} 天, {len(merged)} 条")
+
+        if missing:
+            print(f"  [!] {y} 缺失 {len(missing)} 天: {', '.join(missing)}")
+
+    pbar.close()
+    print("[daily_basic] 完成")
 
 
 # ============================================================
 # 增量逻辑
 # ============================================================
-def get_max_date(table):
-    """获取表中最大交易日期，无数据返回 None"""
-    db = get_db()
-    result = db.execute(f"SELECT MAX(trade_date) FROM {table}").fetchone()
+def get_max_date(table, db_path=None, column="trade_date"):
+    """获取表中最大日期，无数据返回 None"""
+    db = get_db(db_path)
+    result = db.execute(f"SELECT MAX({column}) FROM {table}").fetchone()
     db.close()
     return result[0] if result else None
 
@@ -325,7 +387,7 @@ def incremental_update(end_date=None):
         end_date = pd.Timestamp.now().strftime("%Y%m%d")
 
     # 小表直接串行增量
-    last = get_max_date("trade_cal")
+    last = get_max_date("trade_cal", column="cal_date")
     if last:
         start = (pd.Timestamp(last) + pd.Timedelta(days=1)).strftime("%Y%m%d")
         if start < end_date:
@@ -367,7 +429,14 @@ def full_load(start_date, end_date):
     pull_trade_cal(start_date, end_date)
     pull_daily(start_date, end_date)
     pull_daily_basic(start_date, end_date)
-    pull_stock_st(start_date, end_date)
+    try:
+        pull_stock_st(start_date, end_date)
+    except Exception as e:
+        msg = str(e)
+        if "权限" in msg or "permission" in msg.lower():
+            print(f"[stock_st] 无接口权限，跳过（{msg[:80]}）")
+        else:
+            raise
     print("全量拉取完成")
 
 
@@ -377,20 +446,27 @@ def full_load(start_date, end_date):
 def run(start_date=None, end_date=None):
     """
     主入口：自动判断全量还是增量。
-    - 若 daily 表为空 → 全量拉取（start_date 必传）
-    - 若 daily 表有数据 → 增量更新
+    - 若指定 start_date → 全量拉取（覆盖已有数据）
+    - 若 daily 表为空且无 start_date → 报错
+    - 若 daily 表有数据且无 start_date → 增量更新
     """
     if end_date is None:
         end_date = pd.Timestamp.now().strftime("%Y%m%d")
 
-    last = get_max_date("daily")
-    if last is None:
-        if start_date is None:
-            raise ValueError("首次运行需指定 start_date，例如: run('20200101')")
+    if start_date is not None:
+        print(f"全量拉取: {start_date} ~ {end_date}")
         full_load(start_date, end_date)
-    else:
-        print(f"daily 表最新日期: {last}，走增量更新")
-        incremental_update(end_date)
+        return
+
+    try:
+        last = get_max_date("daily")
+    except Exception:  
+        last = None    # 如果报错（说明表不存在或为空），就当作是首次运行
+    
+    if last is None:
+        raise ValueError("首次运行需指定 start_date，例如: run('20200101')")
+    print(f"daily 表最新日期: {last}，走增量更新")
+    incremental_update(end_date)
 
 
 # ============================================================

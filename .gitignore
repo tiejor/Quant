@@ -33,3 +33,5 @@ Thumbs.db
 # claude
 .agents
 .claude
+CLAUDE.md
+docs/agents/

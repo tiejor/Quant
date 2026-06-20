@@ -99,6 +99,128 @@ def assign_groups(factor_values: pd.Series, n_groups: int) -> pd.Series:
 
 
 # ============================================================
+# 分组收益追踪 — 纯函数，不依赖 DuckDB
+# ============================================================
+def compute_group_returns(
+    factor_values: list[tuple[pd.Timestamp, pd.Series]],
+    daily_returns: dict[pd.Timestamp, pd.Series],
+    trading_days: pd.DatetimeIndex,
+    freq: str = "monthly",
+    n_groups: int = 10,
+    offset: int = 0,
+    weighting: str = "equal",
+    market_caps: dict[pd.Timestamp, pd.Series] | None = None,
+) -> pd.DataFrame:
+    """
+    给定因子值和日收益，追踪分组每日收益。
+
+    参数：
+        factor_values:  [(日期, 因子值Series), ...] 按时间升序
+        daily_returns:  {日期: 日收益Series}
+        trading_days:   完整交易日序列
+        freq:           "daily" | "weekly" | "monthly"
+        n_groups:       分组数
+        weighting:      "equal" | "market_cap"
+        market_caps:    {日期: circ_mv Series}，仅 market_cap 模式使用
+
+    返回：
+        DataFrame，index=trade_date，columns=group_1..group_N + long_short
+    """
+    if not factor_values or len(trading_days) == 0:
+        return pd.DataFrame()
+
+    fv_by_date: dict[pd.Timestamp, pd.Series] = {}
+    for d, fv in factor_values:
+        fv_by_date[pd.Timestamp(d)] = fv
+
+    if freq == "daily":
+        factor_dates = trading_days
+    elif freq == "weekly":
+        factor_dates = _last_trading_day_of_week(trading_days)
+    elif freq == "monthly":
+        factor_dates = _last_trading_day_of_month(trading_days)
+    else:
+        raise ValueError(f"未知频率: {freq}")
+
+    daily_records: list[dict[str, object]] = []
+
+    for i, fc_date in enumerate(factor_dates):
+        fv = fv_by_date.get(fc_date)
+        if fv is None or len(fv.dropna()) < n_groups * 2:
+            continue
+
+        rebalance_date = _nth_trading_day_after(fc_date, trading_days, offset)
+        if rebalance_date is None:
+            continue
+
+        if i + 1 < len(factor_dates):
+            next_rebalance = _nth_trading_day_after(factor_dates[i + 1], trading_days, offset)
+            if next_rebalance is None:
+                hold_end = trading_days[-1]
+            else:
+                try:
+                    idx = trading_days.tolist().index(next_rebalance)
+                    hold_end = trading_days[idx - 1] if idx > 0 else next_rebalance
+                except ValueError:
+                    hold_end = trading_days[-1]
+        else:
+            hold_end = trading_days[-1]
+
+        groups = assign_groups(fv.dropna(), n_groups)
+        if groups.empty:
+            continue
+
+        mc_series = None
+        if weighting == "market_cap" and market_caps is not None:
+            mc_series = market_caps.get(fc_date)
+
+        hold_days = trading_days[(trading_days >= rebalance_date) & (trading_days <= hold_end)]
+        for day in hold_days:
+            rets = daily_returns.get(day)
+            if rets is None or rets.empty:
+                continue
+
+            record: dict[str, object] = {"trade_date": day}
+            for grp in range(1, n_groups + 1):
+                grp_stocks = groups[groups == grp].index.tolist()
+                grp_rets = rets[rets.index.isin(grp_stocks)]
+                if len(grp_rets) == 0:
+                    record[f"group_{grp}"] = 0.0
+                    continue
+
+                if weighting == "market_cap" and mc_series is not None:
+                    w = mc_series[mc_series.index.isin(grp_rets.index)]
+                    w = w[w > 0]
+                    common = grp_rets.index.intersection(w.index)
+                    if len(common) > 0:
+                        w_norm = w.loc[common] / w.loc[common].sum()
+                        record[f"group_{grp}"] = float(
+                            (grp_rets.loc[common] * w_norm).sum()
+                        )
+                    else:
+                        record[f"group_{grp}"] = float(grp_rets.mean())
+                else:
+                    record[f"group_{grp}"] = float(grp_rets.mean())
+
+            record["long_short"] = float(record.get("group_1", 0.0)) - float(record.get(f"group_{n_groups}", 0.0))
+            daily_records.append(record)
+
+    if not daily_records:
+        return pd.DataFrame()
+
+    gr = pd.DataFrame(daily_records).set_index("trade_date")
+    gr.index = pd.to_datetime(gr.index)
+    return gr.sort_index()
+
+
+def _last_trading_day_of_week(trading_days: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """从交易日序列中挑出每周最后一个交易日."""
+    df = pd.DataFrame({"date": trading_days})
+    df["iso"] = df["date"].dt.isocalendar().year.astype(str) + "-" + df["date"].dt.isocalendar().week.astype(str)
+    return pd.DatetimeIndex(df.groupby("iso")["date"].max())
+
+
+# ============================================================
 # 数据加载
 # ============================================================
 def _load_daily_returns(ts_codes: list[str], date: str, db_path: str | None = None) -> pd.Series:
@@ -151,9 +273,10 @@ def run_backtest(
     offset: int = 0,
     silent: bool = False,
     db_path: str | None = None,
+    freq: str = "monthly",
 ) -> dict:
     """
-    月频截面回测。
+    截面回测（支持日/周/月三种频率）。
 
     参数：
         start_date:  回测起始日 YYYYMMDD
@@ -161,11 +284,15 @@ def run_backtest(
         factor_name: 因子名称（factors.py FACTOR_REGISTRY 中的 key）
         n_groups:    分组数（默认 10）
         standardize: 是否做截面 MAD 标准化（默认 True）
+        offset:      调仓日偏移交易日数（多轨道用）
+        freq:        调仓频率 "daily" | "weekly" | "monthly"
         db_path:     数据库路径（默认使用 data/quant.duckdb）
 
     返回字典：
         group_returns:  DataFrame，每列为一组 + long_short 的日度收益率
         group_nav:      DataFrame，各组 + 多空累计净值
+        factor_values:  [(date_str, Series), ...]
+        forward_returns: [Series, ...]
     """
     factor_fn = get_factor(factor_name)
 
@@ -174,123 +301,123 @@ def run_backtest(
     if len(all_days) == 0:
         raise ValueError(f"区间 {start_date}~{end_date} 无交易日")
 
-    # 每月最后一个交易日 = 因子计算日
-    factor_dates = _last_trading_day_of_month(all_days)
+    # 因子计算日（按频率）
+    if freq == "daily":
+        factor_dates = all_days
+    elif freq == "weekly":
+        factor_dates = _last_trading_day_of_week(all_days)
+    elif freq == "monthly":
+        factor_dates = _last_trading_day_of_month(all_days)
+    else:
+        raise ValueError(f"未知频率: {freq}")
+
+    freq_label = {"daily": "日频", "weekly": "周频", "monthly": "月频"}.get(freq, freq)
 
     if not silent:
         print(f"[backtest] 回测区间: {all_days[0].strftime('%Y%m%d')} ~ {all_days[-1].strftime('%Y%m%d')}")
-        print(f"[backtest] 交易天数: {len(all_days)}，月数: {len(factor_dates)}，偏移: {offset}")
+        print(f"[backtest] 交易天数: {len(all_days)}，{freq_label}，调仓次数: {len(factor_dates)}，偏移: {offset}")
         print(f"[backtest] 因子: {factor_name}，分组数: {n_groups}，标准化: {standardize}")
 
-    # 存储各组 + 多空每日收益率
-    daily_records = []  # [{trade_date, group_1, ..., group_N, long_short}]
+    # 批量预加载区间内所有 daily_basic 和 daily 数据
+    db = _get_db(db_path)
+    all_basic = db.execute(
+        "SELECT ts_code, trade_date, pb, total_mv, circ_mv, turnover_rate "
+        "FROM daily_basic WHERE trade_date BETWEEN ? AND ?",
+        [start_date, end_date]
+    ).df()
+    all_daily = db.execute(
+        "SELECT ts_code, trade_date, pct_chg FROM daily WHERE trade_date BETWEEN ? AND ?",
+        [start_date, end_date]
+    ).df()
+    db.close()
 
-    # IC 评估数据
-    factor_values_list = []  # [(date_str, Series)]
-    forward_returns_list = []  # [Series]
+    all_daily["return"] = all_daily["pct_chg"] / 100.0
 
-    # 逐月回测
-    for i, fc_date in enumerate(factor_dates):
+    basic_by_date: dict[str, pd.DataFrame] = {}
+    for d, grp in all_basic.groupby("trade_date"):
+        basic_by_date[str(d)] = grp.set_index("ts_code")
+
+    daily_returns: dict[pd.Timestamp, pd.Series] = {}
+    for d, grp in all_daily.groupby("trade_date"):
+        daily_returns[pd.Timestamp(str(d))] = grp.set_index("ts_code")["return"]
+
+    # 因子值计算（遍历因子计算日）
+    factor_values_list: list[tuple[str, pd.Series]] = []  # [(date_str, Series)]
+    factor_values_for_cgr: list[tuple[pd.Timestamp, pd.Series]] = []
+
+    for fc_date in factor_dates:
         fc_str = fc_date.strftime("%Y%m%d")
 
-        # 调仓日 = 因子计算日之后第 offset 个交易日（offset=0 即下一个交易日）
-        rebalance_date = _nth_trading_day_after(fc_date, all_days, offset)
-        if rebalance_date is None:
+        fac_data = basic_by_date.get(fc_str)
+        if fac_data is None or fac_data.empty:
             continue
 
-        # 持仓期结束日 = 下一个调仓日 - 1（即下个因子计算日之后的调仓日前一天）
-        # 简化：持仓到当前月的最后一个交易日前
-        # 实际 = 本月调仓日 → 下月调仓日前一天
+        universe = filter_universe(fc_str, db_path=db_path)
+        if len(universe) < n_groups * 2:
+            continue
+
+        fac_data = fac_data[fac_data.index.isin(universe)]
+        if fac_data.empty:
+            continue
+
+        fv = factor_fn(fac_data).dropna()
+        if len(fv) < n_groups * 2:
+            continue
+        if standardize:
+            fv = mad_standardize(fv)
+
+        factor_values_list.append((fc_str, fv.copy()))
+        factor_values_for_cgr.append((fc_date, fv.copy()))
+
+    # 分组收益追踪（调用纯函数）
+    gr = compute_group_returns(
+        factor_values=factor_values_for_cgr,
+        daily_returns=daily_returns,
+        trading_days=all_days,
+        freq=freq,
+        n_groups=n_groups,
+        offset=offset,
+    )
+
+    if gr.empty:
+        raise RuntimeError("回测未产生任何收益数据，请检查数据覆盖范围")
+
+    # 前向收益：每期持仓期内各股累计收益（IC 评估用）
+    forward_returns_list: list[pd.Series] = []
+    for i, (fc_date, fv) in enumerate(factor_values_for_cgr):
+        rebalance_date = _nth_trading_day_after(fc_date, all_days, offset)
+        if rebalance_date is None:
+            forward_returns_list.append(pd.Series(dtype=float))
+            continue
+
         if i + 1 < len(factor_dates):
-            next_fc = factor_dates[i + 1]
-            next_rebalance = _next_trading_day(next_fc, all_days)
+            next_rebalance = _nth_trading_day_after(factor_dates[i + 1], all_days, offset)
             if next_rebalance is None:
                 hold_end = all_days[-1]
             else:
-                # 找到 next_rebalance 在 all_days 中的位置，往前一天
                 idx = all_days.get_loc(next_rebalance)
                 hold_end = all_days[idx - 1] if idx > 0 else next_rebalance
         else:
             hold_end = all_days[-1]
 
-        # 股票池（调仓日更新）
-        universe = filter_universe(fc_str, db_path=db_path)
-        if len(universe) < n_groups * 2:
-            if not silent:
-                print(f"  [{fc_str}] 股票池太小 ({len(universe)} 只)，跳过此月")
-            continue
-
-        # 加载因子计算日的截面数据
-        fac_data = _load_factor_data(fc_str, universe, db_path=db_path)
-        if fac_data.empty:
-            print(f"  [{fc_str}] 无因子数据，跳过")
-            continue
-
-        # 计算因子值
-        factor_values = factor_fn(fac_data)
-        factor_values = factor_values.dropna()
-        if len(factor_values) < n_groups * 2:
-            print(f"  [{fc_str}] 有效因子值太少 ({len(factor_values)})，跳过")
-            continue
-
-        # MAD 标准化
-        if standardize:
-            factor_values = mad_standardize(factor_values)
-
-        # 保存因子值（IC 评估用）
-        factor_values_list.append((fc_str, factor_values.copy()))
-
-        # 分组
-        groups = assign_groups(factor_values, n_groups)
-
-        # 持仓期内逐日追踪
         hold_days = all_days[(all_days >= rebalance_date) & (all_days <= hold_end)]
-        stock_returns = {}  # ts_code → list of daily returns
+        stocks = fv.index.tolist()
+        stock_cum: dict[str, list[float]] = {c: [] for c in stocks}
         for day in hold_days:
-            day_str = day.strftime("%Y%m%d")
-            # 加载该日所有分组内股票的收益率
-            rets = _load_daily_returns(list(groups.index), day_str, db_path=db_path)
-            if rets.empty:
+            rets = daily_returns.get(day)
+            if rets is None:
                 continue
+            for c in stocks:
+                if c in rets.index:
+                    stock_cum[c].append(rets[c])
 
-            for ts_code, ret_val in rets.items():
-                if ts_code not in stock_returns:
-                    stock_returns[ts_code] = []
-                stock_returns[ts_code].append(ret_val)
+        cum = pd.Series({
+            c: (np.prod([1 + r for r in rets]) - 1) if rets else np.nan
+            for c, rets in stock_cum.items()
+        })
+        cum.name = fc_date.strftime("%Y%m%d")
+        forward_returns_list.append(cum)
 
-            record = {"trade_date": day_str}
-            for grp in range(1, n_groups + 1):
-                grp_stocks = groups[groups == grp].index.tolist()
-                grp_rets = rets[rets.index.isin(grp_stocks)]
-                if len(grp_rets) > 0:
-                    record[f"group_{grp}"] = grp_rets.mean()  # 等权平均
-                else:
-                    record[f"group_{grp}"] = 0.0
-
-            # 多空：G1 - GN
-            record["long_short"] = record.get(f"group_1", 0.0) - record.get(f"group_{n_groups}", 0.0)
-            daily_records.append(record)
-
-        # 前向收益：每只股票在持仓期内的累计收益
-        if stock_returns:
-            fwd = pd.Series({
-                c: (np.prod([1 + r for r in rets]) - 1)
-                for c, rets in stock_returns.items()
-            })
-            fwd.name = fc_str
-            forward_returns_list.append(fwd)
-        else:
-            forward_returns_list.append(pd.Series(dtype=float))
-
-    # 汇总结果
-    gr = pd.DataFrame(daily_records).set_index("trade_date")
-    gr.index = pd.to_datetime(gr.index)
-    gr = gr.sort_index()
-
-    if gr.empty:
-        raise RuntimeError("回测未产生任何收益数据，请检查数据覆盖范围")
-
-    # 累计净值
     nav = (1 + gr).cumprod()
 
     if not silent:
@@ -310,16 +437,19 @@ def run_pathways(
     start_date: str,
     end_date: str,
     factor_name: str,
-    n_pathways: int = 5,
+    n_pathways: int = 15,
     n_groups: int = 10,
     standardize: bool = True,
+    freq: str = "monthly",
 ) -> list[dict]:
     """
     多轨道回测：对调仓日偏移 0, 1, ..., n_pathways-1 个交易日，每条轨道独立回测。
+    仅适用于月频，用于检验因子买点对调仓日选择的敏感度。
 
     参数：
         start_date, end_date, factor_name, n_groups, standardize: 同 run_backtest
-        n_pathways: 轨道数（含基准轨道 k=0）
+        n_pathways: 轨道数（含基准轨道 k=0，默认 15）
+        freq:        调仓频率（默认 "monthly"，仅月频推荐使用多轨道）
 
     返回：
         [{pathway, group_returns, group_nav}, ...] 按偏移量排序
@@ -335,7 +465,8 @@ def run_pathways(
                 n_groups=n_groups,
                 standardize=standardize,
                 offset=k,
-                silent=(k > 0),  # 基准轨道打印日志，其余静默
+                silent=(k > 0),
+                freq=freq,
             )
             res["pathway"] = k
             results.append(res)

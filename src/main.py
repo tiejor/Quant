@@ -9,19 +9,24 @@ import time
 import argparse
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 import duckdb
 
 from src.pipeline import run as pipeline_run
-from src.backtest import run_pathways
+from src.backtest import run_pathways, run_backtest
 from src.evaluate import (
     evaluate_performance,
     evaluate_all_groups,
     plot_group_nav,
     plot_ic_timeline,
+    plot_ic_timeline_with_cumulative,
+    plot_ic_distribution,
     plot_ic_decay,
+    plot_pathway_nav_overlay,
     compute_ic_series,
     evaluate_ic,
+    compute_ic_lag_curve,
 )
 
 DB_PATH = "data/quant.duckdb"
@@ -39,7 +44,7 @@ def main():
     parser.add_argument("--start", default="20200101", help="回测起始日 YYYYMMDD")
     parser.add_argument("--end", default=None, help="回测结束日 YYYYMMDD（默认今天）")
     parser.add_argument("--groups", type=int, default=10, help="分组数（默认 10）")
-    parser.add_argument("--pathways", type=int, default=5, help="轨道数（默认 5）")
+    parser.add_argument("--pathways", type=int, default=15, help="轨道数（默认 15，仅月频生效）")
     parser.add_argument("--no-standardize", action="store_true", help="不做截面 MAD 标准化")
     parser.add_argument("--skip-pipeline", action="store_true", help="跳过数据拉取")
     args = parser.parse_args()
@@ -61,80 +66,138 @@ def main():
             print("若数据已是最新，可用 --skip-pipeline 跳过")
             sys.exit(1)
 
-    # 2. 回测（多轨道）
-    print("\n" + "=" * 60)
-    print(f"步骤 2/3: 多轨道回测 — 因子={args.factor}, 区间={args.start}~{args.end}")
-    print("=" * 60)
-    t0 = time.time()
+    # 2. 回测 + 评估（三频率）
+    FREQUENCIES = [
+        ("daily", "日频", False),
+        ("weekly", "周频", False),
+        ("monthly", "月频", True),
+    ]
+    max_lag_map = {"daily": 20, "weekly": 12, "monthly": 12}
 
-    try:
-        pathways = run_pathways(
-            start_date=args.start,
-            end_date=args.end,
-            factor_name=args.factor,
-            n_pathways=args.pathways,
-            n_groups=args.groups,
-            standardize=not args.no_standardize,
-        )
-    except Exception as e:
-        print(f"回测失败: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-
-    elapsed = time.time() - t0
-    print(f"回测耗时: {elapsed:.1f}s")
-
-    # 3. 评估 + 出图
-    print("\n" + "=" * 60)
-    print("步骤 3/3: 因子评估")
-    print("=" * 60)
-
-    base = pathways[0]  # 基准轨道（k=0）
-    gr = base["group_returns"]
-    nav = base["group_nav"]
-
-    # 绩效指标
-    perf_df = evaluate_all_groups(gr)
-    print("\n基准轨道绩效指标:")
     pd.set_option("display.float_format", "{:.4f}".format)
-    print(perf_df.to_string())
+    all_results: dict[str, dict] = {}
 
-    # 出图
-    plot_group_nav(nav, args.factor)
+    for freq, freq_label, use_pathways in FREQUENCIES:
+        print("\n" + "=" * 60)
+        print(f"步骤 2/3: 回测 — {freq_label} 因子={args.factor}, 区间={args.start}~{args.end}")
+        print("=" * 60)
+        t0 = time.time()
 
-    # IC 评估
-    fv = base.get("factor_values", [])
-    fwd = base.get("forward_returns", [])
-    if fv and fwd:
-        fv_series = [s for _, s in fv]
-        ic = compute_ic_series(fv_series, fwd)
-        ic_metrics = evaluate_ic(ic)
-        print(f"\n基准轨道 IC 评估:")
-        print(f"  IC 均值: {ic_metrics['ic_mean']:.4f}")
-        print(f"  IR:      {ic_metrics['ic_ir']:.4f}")
-        print(f"  t 值:    {ic_metrics['t_stat']:.2f}  (p={ic_metrics['p_value']:.4f})")
-        print(f"  半衰期:  {ic_metrics['half_life']} 期")
-        print(f"  期数:    {ic_metrics['n_periods']}")
+        try:
+            if use_pathways:
+                pathways = run_pathways(
+                    start_date=args.start,
+                    end_date=args.end,
+                    factor_name=args.factor,
+                    n_pathways=args.pathways,
+                    n_groups=args.groups,
+                    standardize=not args.no_standardize,
+                    freq=freq,
+                )
+                base = pathways[0]
+            else:
+                base = run_backtest(
+                    start_date=args.start,
+                    end_date=args.end,
+                    factor_name=args.factor,
+                    n_groups=args.groups,
+                    standardize=not args.no_standardize,
+                    offset=0,
+                    freq=freq,
+                )
+                pathways = None
+        except Exception as e:
+            print(f"回测失败 ({freq_label}): {e}")
+            import traceback
+            traceback.print_exc()
+            continue
 
-        plot_ic_timeline(ic, args.factor)
-        plot_ic_decay(ic, args.factor)
+        elapsed = time.time() - t0
+        print(f"回测耗时: {elapsed:.1f}s")
 
-    # 多轨道汇总
-    print(f"\n多轨道汇总（{len(pathways)} 条轨道）:")
-    all_perf = {}
-    for pw in pathways:
-        k = pw["pathway"]
-        perf = evaluate_performance(pw["group_returns"]["long_short"])
-        for metric, val in perf.items():
-            if metric not in all_perf:
-                all_perf[metric] = []
-            all_perf[metric].append(val)
+        gr = base["group_returns"]
+        nav = base["group_nav"]
+        fv = base.get("factor_values", [])
+        fwd = base.get("forward_returns", [])
 
-    for metric, vals in all_perf.items():
-        vals_arr = pd.Series(vals).dropna()
-        if len(vals_arr) > 0:
-            print(f"  {metric}: {vals_arr.mean():.4f} ± {vals_arr.std():.4f}")
+        # 绩效指标
+        perf_df = evaluate_all_groups(gr)
+        print(f"\n{freq_label} 绩效指标:")
+        print(perf_df.to_string())
+
+        # 分组净值图
+        plot_group_nav(nav, args.factor, freq=freq)
+
+        # IC 评估
+        ic_metrics = None
+        if fv and fwd:
+            fv_series = [s for _, s in fv]
+            ic = compute_ic_series(fv_series, fwd)
+            ic_metrics = evaluate_ic(ic)
+            print(f"\n{freq_label} IC 评估:")
+            print(f"  IC 均值: {ic_metrics['ic_mean']:.4f}")
+            print(f"  IR:      {ic_metrics['ic_ir']:.4f}")
+            print(f"  t 值:    {ic_metrics['t_stat']:.2f}  (p={ic_metrics['p_value']:.4f})")
+            print(f"  期数:    {ic_metrics['n_periods']}")
+
+            if freq == "monthly":
+                plot_ic_timeline_with_cumulative(ic, args.factor, freq=freq)
+            else:
+                plot_ic_timeline(ic, args.factor, freq=freq)
+            plot_ic_distribution(ic, args.factor, freq=freq)
+
+            # IC 衰减曲线（lag-based）
+            max_lag = max_lag_map.get(freq, 12)
+            ic_curve, half_life = compute_ic_lag_curve(fv_series, fwd, max_lag=max_lag)
+            if ic_curve:
+                print(f"  IC 半衰期 (lag-based): {half_life} 期")
+            plot_ic_decay(ic_curve, half_life, args.factor, freq=freq)
+
+        # 多轨道汇总（仅月频）
+        if pathways and len(pathways) > 1:
+            print(f"\n多轨道汇总（{len(pathways)} 条轨道）:")
+            all_perf = {}
+            for pw in pathways:
+                perf = evaluate_performance(pw["group_returns"]["long_short"])
+                for metric, val in perf.items():
+                    if metric not in all_perf:
+                        all_perf[metric] = []
+                    all_perf[metric].append(val)
+            for metric, vals in all_perf.items():
+                vals_arr = pd.Series(vals).dropna()
+                if len(vals_arr) > 0:
+                    print(f"  {metric}: {vals_arr.mean():.4f} ± {vals_arr.std():.4f}")
+
+            plot_pathway_nav_overlay(pathways, args.factor, freq=freq)
+
+        # 收集跨频率汇总数据
+        ls = gr["long_short"] if "long_short" in gr.columns else pd.Series(dtype=float)
+        all_results[freq_label] = {
+            "long_short": ls,
+            "ic": ic_metrics,
+        }
+
+    # 跨频率汇总
+    if all_results:
+        print("\n" + "=" * 60)
+        print("频率对比汇总")
+        print("=" * 60)
+        rows = []
+        for freq_label, data in all_results.items():
+            row = {"频率": freq_label}
+            ls = data["long_short"]
+            if not ls.empty:
+                perf = evaluate_performance(ls)
+                row["多空年化收益"] = perf.get("ann_return", np.nan)
+                row["多空夏普"] = perf.get("sharpe", np.nan)
+                row["多空最大回撤"] = perf.get("max_drawdown", np.nan)
+            ic_d = data.get("ic")
+            if ic_d:
+                row["IC均值"] = ic_d.get("ic_mean", np.nan)
+                row["IC_IR"] = ic_d.get("ic_ir", np.nan)
+            rows.append(row)
+        if rows:
+            print(pd.DataFrame(rows).to_string(index=False))
 
     print(f"\n图表已保存到 {OUTPUT_DIR}/ 目录")
 

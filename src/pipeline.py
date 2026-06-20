@@ -48,6 +48,29 @@ def get_db(db_path=None):
 # ============================================================
 # 建表
 # ============================================================
+def _migrate_daily_basic_columns(db):
+    """为存量 daily_basic 表补全缺失列（无则添加）."""
+    full_columns = [
+        ("close", "DOUBLE"),
+        ("turnover_rate_f", "DOUBLE"),
+        ("volume_ratio", "DOUBLE"),
+        ("pe", "DOUBLE"),
+        ("pe_ttm", "DOUBLE"),
+        ("ps", "DOUBLE"),
+        ("ps_ttm", "DOUBLE"),
+        ("dv_ratio", "DOUBLE"),
+        ("dv_trade", "DOUBLE"),
+        ("total_share", "DOUBLE"),
+        ("float_share", "DOUBLE"),
+        ("free_share", "DOUBLE"),
+    ]
+    existing = db.execute("SELECT column_name FROM information_schema.columns WHERE table_name='daily_basic'").fetchall()
+    existing_names = {row[0] for row in existing}
+    for col_name, col_type in full_columns:
+        if col_name not in existing_names:
+            db.execute(f"ALTER TABLE daily_basic ADD COLUMN {col_name} {col_type}")
+
+
 def init_tables(db_path=None):
     """初始化所有数据表（不存在则创建）"""
     db = get_db(db_path)
@@ -82,17 +105,36 @@ def init_tables(db_path=None):
             PRIMARY KEY (ts_code, trade_date)
         )
     """)
+    # 存量表迁移：为旧 daily 表补全 change 列（Tushare 默认返回）
+    existing = db.execute("SELECT column_name FROM information_schema.columns WHERE table_name='daily'").fetchall()
+    existing_names = {row[0] for row in existing}
+    if "change" not in existing_names:
+        db.execute("ALTER TABLE daily ADD COLUMN change DOUBLE")
     db.execute("""
         CREATE TABLE IF NOT EXISTS daily_basic (
-            ts_code       TEXT,
-            trade_date    TEXT,
-            pb            DOUBLE,
-            total_mv      DOUBLE,
-            circ_mv       DOUBLE,
-            turnover_rate DOUBLE,
+            ts_code         TEXT,
+            trade_date      TEXT,
+            close           DOUBLE,
+            turnover_rate   DOUBLE,
+            turnover_rate_f DOUBLE,
+            volume_ratio    DOUBLE,
+            pe              DOUBLE,
+            pe_ttm          DOUBLE,
+            pb              DOUBLE,
+            ps              DOUBLE,
+            ps_ttm          DOUBLE,
+            dv_ratio        DOUBLE,
+            dv_trade        DOUBLE,
+            total_share     DOUBLE,
+            float_share     DOUBLE,
+            free_share      DOUBLE,
+            total_mv        DOUBLE,
+            circ_mv         DOUBLE,
             PRIMARY KEY (ts_code, trade_date)
         )
     """)
+    # 存量表迁移：为旧 daily_basic 表补全列
+    _migrate_daily_basic_columns(db)
     db.execute("""
         CREATE TABLE IF NOT EXISTS stock_st (
             ts_code    TEXT,
@@ -120,6 +162,7 @@ def _fetch_with_retry(fetch_fn, label: str, max_retries=MAX_RETRIES, sleep_sec=R
     其他错误 → 直接抛出。
     全失败 → 返回 None。
     """
+    time.sleep(1.2)
     for attempt in range(1, max_retries + 1):
         try:
             return fetch_fn()
@@ -244,10 +287,7 @@ def _fetch_one_daily_day(date: str):
     label = f"daily/{date}"
 
     def _do(d=date):
-        df = _get_pro().daily(
-            trade_date=d,
-            fields="ts_code,trade_date,open,high,low,close,pre_close,pct_chg,vol,amount"
-        )
+        df = _get_pro().daily(trade_date=d)
         return df
 
     df = _fetch_with_retry(_do, label)
@@ -259,10 +299,7 @@ def _fetch_one_daily_basic_day(date: str):
     label = f"daily_basic/{date}"
 
     def _do(d=date):
-        df = _get_pro().daily_basic(
-            trade_date=d,
-            fields="ts_code,trade_date,pb,total_mv,circ_mv,turnover_rate"
-        )
+        df = _get_pro().daily_basic(trade_date=d)
         return df
 
     df = _fetch_with_retry(_do, label)
@@ -415,6 +452,14 @@ def incremental_update(end_date=None):
 
     # 基础信息全量覆盖
     pull_stock_basic()
+
+    # 补拉全量缺失数据（从最早交易日起查，不遗漏历史缺口）
+    print("检查缺失数据...")
+    db = get_db()
+    first_day = db.execute("SELECT MIN(cal_date) FROM trade_cal WHERE is_open=1").fetchone()[0]
+    db.close()
+    fill_missing_dates(str(first_day) if first_day else "20000101", end_date)
+
     print("增量更新完成")
 
 
@@ -470,11 +515,88 @@ def run(start_date=None, end_date=None):
 
 
 # ============================================================
+# 缺失数据检查与补拉
+# ============================================================
+def _find_missing_dates(table: str, start_date: str, end_date: str, db_path: str | None = None) -> list[str]:
+    """
+    查询指定表在区间内缺失数据的交易日列表。
+    对比 trade_cal 中的交易日和表中已有的 trade_date，返回差集。
+    """
+    db = get_db(db_path)
+    trading_days = db.execute(
+        "SELECT cal_date FROM trade_cal WHERE is_open=1 AND cal_date BETWEEN ? AND ? ORDER BY cal_date",
+        [start_date, end_date]
+    ).df()
+    if trading_days.empty:
+        db.close()
+        return []
+
+    existing = db.execute(
+        f"SELECT DISTINCT trade_date FROM {table} WHERE trade_date BETWEEN ? AND ?",
+        [start_date, end_date]
+    ).df()
+    db.close()
+
+    td_set = set(trading_days["cal_date"].tolist())
+    ex_set = set(existing["trade_date"].tolist()) if not existing.empty else set()
+    missing = sorted(td_set - ex_set)
+    return missing
+
+
+def fill_missing_dates(start_date: str, end_date: str, db_path: str | None = None) -> dict[str, list[str]]:
+    """
+    检查 daily 和 daily_basic 表中缺失的交易日，按天并行补拉。
+    复用 _fetch_one_daily_day / _fetch_one_daily_basic_day，带重试。
+    返回 {"daily": [...], "daily_basic": [...]} 各表成功补齐的日期列表。
+    """
+    result: dict[str, list[str]] = {}
+
+    for table, fetch_fn in [("daily", _fetch_one_daily_day), ("daily_basic", _fetch_one_daily_basic_day)]:
+        missing = _find_missing_dates(table, start_date, end_date, db_path=db_path)
+        if not missing:
+            print(f"[{table}] 已是最新，无需补拉")
+            result[table] = []
+            continue
+
+        print(f"[{table}] 缺失 {len(missing)} 天: {', '.join(missing[:10])}{'...' if len(missing) > 10 else ''}")
+
+        results = Parallel(n_jobs=-1, prefer="threads")(
+            delayed(fetch_fn)(d) for d in missing
+        )
+
+        filled = []
+        for date, df in results:
+            if df is not None and len(df) > 0:
+                db = get_db(db_path)
+                db.execute(f"INSERT OR IGNORE INTO {table} SELECT * FROM df")
+                db.close()
+                filled.append(date)
+
+        failed = [d for d in missing if d not in filled]
+        print(f"[{table}] 补齐 {len(filled)}/{len(missing)} 天"
+              + (f", 失败: {', '.join(failed)}" if failed else ""))
+        result[table] = filled
+
+    return result
+
+
+# ============================================================
 # 命令行入口
 # ============================================================
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) >= 3:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--fill-missing":
+        start = sys.argv[2] if len(sys.argv) >= 3 else None
+        end = sys.argv[3] if len(sys.argv) >= 4 else None
+        if start is None:
+            print("用法: python src/pipeline.py --fill-missing <start_date> [end_date]")
+            sys.exit(1)
+        if end is None:
+            end = pd.Timestamp.now().strftime("%Y%m%d")
+        init_tables()
+        result = fill_missing_dates(start, end)
+        print(f"\n补拉完成: daily {len(result['daily'])} 天, daily_basic {len(result['daily_basic'])} 天")
+    elif len(sys.argv) >= 3:
         run(sys.argv[1], sys.argv[2])
     elif len(sys.argv) == 1:
         run()
@@ -482,3 +604,4 @@ if __name__ == "__main__":
         print("用法: python src/pipeline.py [start_date] [end_date]")
         print("  无参数 → 增量更新")
         print("  start_date end_date → 全量拉取")
+        print("  --fill-missing start_date [end_date] → 检查并补拉缺失日")

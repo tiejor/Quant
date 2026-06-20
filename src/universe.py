@@ -14,13 +14,14 @@ def _get_db(db_path: str | None = None):
     return duckdb.connect(db_path or DB_PATH, read_only=True)
 
 
-def filter_universe(trade_date: str, db_path: str | None = None) -> list[str]:
+def filter_universe(trade_date: str, db_path: str | None = None, index_code: str | None = None) -> list[str]:
     """
     返回指定调仓日有资格进入分组的股票代码列表。
     过滤规则：
       1. 排除当日为 ST 的股票
       2. 排除上市不足 365 天的新股（list_date 早于 trade_date 至少 365 天）
     停牌不做剔除。
+    index_code: 预留参数，指定指数成分股过滤（None = 全市场）。
     """
     db = _get_db(db_path)
 

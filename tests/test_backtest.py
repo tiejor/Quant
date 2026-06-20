@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 import duckdb
 from conftest import requires_db
-from src.backtest import mad_standardize, assign_groups, run_backtest
+from src.backtest import mad_standardize, assign_groups, run_backtest, compute_group_returns
 
 
 # ============================================================
@@ -79,6 +79,48 @@ class TestRunBacktestWithTmpDb:
         assert "group_nav" in result
         assert "factor_values" in result
         assert "forward_returns" in result
+
+    def test_run_backtest_daily_freq(self, tmp_db):
+        """日频回测产出更多记录（每个交易日一次调仓）."""
+        stocks, trading_days = self._seed_tmp_db(tmp_db)
+
+        result = run_backtest(
+            start_date="20240101",
+            end_date="20240228",
+            factor_name="pb_factor",
+            n_groups=2,
+            standardize=False,
+            db_path=tmp_db,
+            freq="daily",
+            silent=True,
+        )
+
+        gr = result["group_returns"]
+        assert not gr.empty
+        assert "long_short" in gr.columns
+        # 日频应有更多交易日记录
+        assert len(gr) > 0
+        # factor_values 数量应接近交易日数
+        assert len(result["factor_values"]) > 0
+
+    def test_run_backtest_weekly_freq(self, tmp_db):
+        """周频回测：每周一次调仓."""
+        self._seed_tmp_db(tmp_db)
+
+        result = run_backtest(
+            start_date="20240101",
+            end_date="20240228",
+            factor_name="pb_factor",
+            n_groups=2,
+            standardize=False,
+            db_path=tmp_db,
+            freq="weekly",
+            silent=True,
+        )
+
+        gr = result["group_returns"]
+        assert not gr.empty
+        assert "long_short" in gr.columns
 
 
 # ============================================================
@@ -215,3 +257,169 @@ class TestAssignGroups:
         result = assign_groups(pd.Series(dtype=float), n_groups=10)
         assert len(result) == 0
         assert result.dtype == int
+
+
+# ============================================================
+# compute_group_returns — 纯函数
+# ============================================================
+class TestComputeGroupReturns:
+    def _make_trading_days(self, n_days: int, start: str = "2024-01-02") -> pd.DatetimeIndex:
+        """生成连续交易日序列，跳过周末."""
+        dates = []
+        current = pd.Timestamp(start)
+        while len(dates) < n_days:
+            if current.dayofweek < 5:  # Mon-Fri
+                dates.append(current)
+            current += pd.Timedelta(days=1)
+        return pd.DatetimeIndex(dates)
+
+    def _make_stocks(self, n: int) -> list[str]:
+        return [f"{i:06d}.SZ" for i in range(n)]
+
+    def test_all_equal_returns(self):
+        """所有股票每天同涨 1% → 各组收益相等，多空 ≈ 0."""
+        stocks = self._make_stocks(20)
+        trading_days = self._make_trading_days(60)
+        np.random.seed(1)
+
+        # 因子值：随机但固定
+        base_fv = pd.Series(np.random.randn(20), index=stocks)
+        factor_values = [(td, base_fv + pd.Series(np.random.randn(20)*0.01, index=stocks))
+                         for td in trading_days]
+
+        # 等收益：所有股票每 1%
+        daily_returns = {td: pd.Series(0.01, index=stocks) for td in trading_days}
+
+        gr = compute_group_returns(factor_values, daily_returns, trading_days,
+                                   freq="daily", n_groups=10)
+        assert not gr.empty
+        # 各组日收益应接近（因为因子值差异很小）
+        group_cols = [c for c in gr.columns if c.startswith("group_")]
+        for day in gr.index[:10]:
+            row_vals = gr.loc[day, group_cols].values
+            assert row_vals.max() - row_vals.min() < 1e-6  # essentially equal
+        # 多空 ≈ 0
+        assert abs(gr["long_short"].mean()) < 1e-4
+
+    def test_top_group_outperforms_bottom(self):
+        """高因子值股票收益高，低因子值股票收益低 → G1 > G10."""
+        stocks = self._make_stocks(20)
+        trading_days = self._make_trading_days(30)
+        # 因子值递减：stock_0 最高, stock_19 最低
+        fv_base = pd.Series(range(20, 0, -1), index=stocks, dtype=float)
+        factor_values = [(td, fv_base) for td in trading_days]
+
+        # 收益递减：stock_0 每天 1%, stock_19 每天 -1%
+        rets = {td: pd.Series([0.01 - 0.002 * i for i in range(20)], index=stocks)
+                for td in trading_days}
+
+        gr = compute_group_returns(factor_values, daily_returns=rets,
+                                   trading_days=trading_days, freq="daily", n_groups=10)
+        # G1（最高因子）收益均值 > G10（最低因子）
+        g1_mean = gr["group_1"].mean()
+        g10_mean = gr["group_10"].mean()
+        assert g1_mean > g10_mean
+        assert gr["long_short"].mean() > 0
+
+    def test_weekly_freq(self):
+        """周频：每周一次调仓."""
+        stocks = self._make_stocks(15)
+        trading_days = self._make_trading_days(30)
+        factor_values = [(td, pd.Series(range(15, 0, -1), index=stocks, dtype=float))
+                         for td in trading_days]
+        daily_returns = {td: pd.Series(0.01, index=stocks) for td in trading_days}
+        gr = compute_group_returns(factor_values, daily_returns, trading_days,
+                                   freq="weekly", n_groups=5)
+        assert not gr.empty
+        assert len(gr) > 0
+
+    def test_monthly_freq(self):
+        """月频：每月一次调仓."""
+        stocks = self._make_stocks(15)
+        trading_days = self._make_trading_days(60)
+        factor_values = [(td, pd.Series(range(15, 0, -1), index=stocks, dtype=float))
+                         for td in trading_days]
+        daily_returns = {td: pd.Series(0.01, index=stocks) for td in trading_days}
+        gr = compute_group_returns(factor_values, daily_returns, trading_days,
+                                   freq="monthly", n_groups=5)
+        assert not gr.empty
+        assert len(gr) > 0
+
+    def test_too_few_stocks_skips(self):
+        """股票数 < n_groups × 2 时跳过当期不崩溃."""
+        stocks = self._make_stocks(5)  # only 5 stocks, need 10 for n_groups=5
+        trading_days = self._make_trading_days(20)
+        factor_values = [(td, pd.Series(range(5, 0, -1), index=stocks, dtype=float))
+                         for td in trading_days]
+        daily_returns = {td: pd.Series(0.01, index=stocks) for td in trading_days}
+        gr = compute_group_returns(factor_values, daily_returns, trading_days,
+                                   freq="daily", n_groups=5)
+        assert gr.empty
+
+    def test_offset_delays_rebalance(self):
+        """offset=1 的调仓日比 offset=0 晚一个交易日."""
+        stocks = self._make_stocks(20)
+        trading_days = self._make_trading_days(60)
+        fv_base = pd.Series(range(20, 0, -1), index=stocks, dtype=float)
+        factor_values = [(td, fv_base) for td in trading_days]
+        daily_returns = {td: pd.Series(0.01, index=stocks) for td in trading_days}
+
+        gr0 = compute_group_returns(factor_values, daily_returns, trading_days,
+                                    freq="daily", n_groups=10, offset=0)
+        gr1 = compute_group_returns(factor_values, daily_returns, trading_days,
+                                    freq="daily", n_groups=10, offset=1)
+
+        assert not gr0.empty
+        assert not gr1.empty
+        # offset=1 的第一条记录应该比 offset=0 晚（更晚开始建仓）
+        assert gr1.index[0] > gr0.index[0]
+
+    def test_market_cap_weighting_known(self):
+        """市值加权：大市值股票权重更高，影响组收益."""
+        stocks = ["A", "B", "C"]
+        trading_days = self._make_trading_days(10)
+        # 因子值相同 → 三只股票进同一组
+        fv = pd.Series([1.0, 1.0, 1.0], index=stocks)
+        factor_values = [(trading_days[0], fv)]
+        # 收益：A=10%, B=0%, C=0%, 等权收益 = 3.33%
+        daily_returns = {td: pd.Series({"A": 0.10, "B": 0.0, "C": 0.0}) for td in trading_days}
+        # A 市值 900, B 市值 100, C 市值 0 (被排除) → A 权重=0.9
+        market_caps = {trading_days[0]: pd.Series({"A": 900, "B": 100, "C": 0})}
+
+        gr = compute_group_returns(factor_values, daily_returns, trading_days,
+                                   freq="daily", n_groups=1, weighting="market_cap",
+                                   market_caps=market_caps)
+        assert not gr.empty
+        # 市值加权：A=0.9, B=0.1 → 加权收益 = 0.9*0.10 + 0.1*0.0 = 0.09
+        g1_val = gr["group_1"].iloc[0]
+        assert pytest.approx(g1_val, abs=0.001) == 0.09
+
+    def test_market_cap_weighting_falls_back_to_equal(self):
+        """无 market_caps 数据时市值加权回退为等权."""
+        stocks = self._make_stocks(20)
+        trading_days = self._make_trading_days(30)
+        factor_values = [(td, pd.Series(range(20, 0, -1), index=stocks, dtype=float))
+                         for td in trading_days]
+        daily_returns = {td: pd.Series(0.01, index=stocks) for td in trading_days}
+
+        gr_mcap = compute_group_returns(factor_values, daily_returns, trading_days,
+                                        freq="daily", n_groups=10, weighting="market_cap")
+        gr_equal = compute_group_returns(factor_values, daily_returns, trading_days,
+                                         freq="daily", n_groups=10, weighting="equal")
+        pd.testing.assert_frame_equal(gr_mcap, gr_equal)
+
+    def test_default_weighting_is_equal(self):
+        """默认 weighting='equal'，向后兼容."""
+        stocks = self._make_stocks(20)
+        trading_days = self._make_trading_days(30)
+        factor_values = [(td, pd.Series(range(20, 0, -1), index=stocks, dtype=float))
+                         for td in trading_days]
+        daily_returns = {td: pd.Series(0.01, index=stocks) for td in trading_days}
+
+        gr = compute_group_returns(factor_values, daily_returns, trading_days,
+                                   freq="daily", n_groups=10)
+        assert not gr.empty
+        # 不传 weighting 参数应该等于传 'equal'
+        gr_explicit = compute_group_returns(factor_values, daily_returns, trading_days,
+                                            freq="daily", n_groups=10, weighting="equal")
+        pd.testing.assert_frame_equal(gr, gr_explicit)

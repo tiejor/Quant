@@ -2,9 +2,10 @@
 data/*.duckdb
 data/*.db
 
-# 输出产物 — 图表由 evaluate.py 重新生成
+# 输出产物 — 图表和 CSV 由 evaluate.py 重新生成
 output/*.png
 output/*.pdf
+output/*.csv
 
 # 敏感信息
 .env
@@ -35,3 +36,4 @@ Thumbs.db
 .claude
 CLAUDE.md
 docs/agents/
+skills-lock.json

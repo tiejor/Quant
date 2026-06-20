@@ -12,6 +12,8 @@ from src.pipeline import (
     pull_trade_cal,
     pull_daily,
     pull_daily_basic,
+    _find_missing_dates,
+    fill_missing_dates,
 )
 
 
@@ -195,3 +197,81 @@ class TestSmoke:
         count = db.execute("SELECT COUNT(*) FROM trade_cal").fetchone()[0]
         db.close()
         assert count >= 10  # 1 个月至少 10 个交易日
+
+
+# ============================================================
+# fill_missing_dates
+# ============================================================
+class TestFindMissingDates:
+    def test_all_present_returns_empty(self, tmp_db):
+        """所有交易日都有数据 → 返回空列表."""
+        init_tables(db_path=tmp_db)
+        db = duckdb.connect(tmp_db)
+        db.execute("INSERT INTO trade_cal VALUES ('20240102', 1, 'SSE'), ('20240103', 1, 'SSE')")
+        db.execute("INSERT INTO daily (ts_code, trade_date, open, high, low, close, pre_close, pct_chg, vol, amount) VALUES ('000001.SZ', '20240102', 10,11,9,10,10,1.0,10000,100000)")
+        db.execute("INSERT INTO daily (ts_code, trade_date, open, high, low, close, pre_close, pct_chg, vol, amount) VALUES ('000001.SZ', '20240103', 10,11,9,10,10,1.0,10000,100000)")
+        db.close()
+
+        missing = _find_missing_dates("daily", "20240101", "20240105", db_path=tmp_db)
+        assert missing == []
+
+    def test_partial_missing(self, tmp_db):
+        """部分交易日缺失 → 返回缺失日期列表."""
+        init_tables(db_path=tmp_db)
+        db = duckdb.connect(tmp_db)
+        db.execute("INSERT INTO trade_cal VALUES ('20240102', 1, 'SSE'), ('20240103', 1, 'SSE'), ('20240104', 1, 'SSE')")
+        db.execute("INSERT INTO daily (ts_code, trade_date, open, high, low, close, pre_close, pct_chg, vol, amount) VALUES ('000001.SZ', '20240102', 10,11,9,10,10,1.0,10000,100000)")
+        # 20240103 and 20240104 missing from daily
+        db.close()
+
+        missing = _find_missing_dates("daily", "20240101", "20240105", db_path=tmp_db)
+        assert set(missing) == {"20240103", "20240104"}
+
+    def test_non_trading_days_excluded(self, tmp_db):
+        """非交易日不参与比较."""
+        init_tables(db_path=tmp_db)
+        db = duckdb.connect(tmp_db)
+        # Only 20240102 is a trading day
+        db.execute("INSERT INTO trade_cal VALUES ('20240102', 1, 'SSE'), ('20240105', 0, 'SSE')")
+        db.close()
+
+        missing = _find_missing_dates("daily", "20240101", "20240105", db_path=tmp_db)
+        assert missing == ["20240102"]  # only trading day, no data → missing
+
+    def test_empty_trade_cal(self, tmp_db):
+        """无交易日 → 返回空列表."""
+        init_tables(db_path=tmp_db)
+        missing = _find_missing_dates("daily", "20240101", "20240105", db_path=tmp_db)
+        assert missing == []
+
+
+class TestFillMissingDates:
+    def test_no_missing_data_no_fetch(self, tmp_db):
+        """数据完整 → 无需下载，返回空列表."""
+        init_tables(db_path=tmp_db)
+        db = duckdb.connect(tmp_db)
+        db.execute("INSERT INTO trade_cal VALUES ('20240102', 1, 'SSE'), ('20240103', 1, 'SSE')")
+        db.execute("INSERT INTO daily (ts_code, trade_date, open, high, low, close, pre_close, pct_chg, vol, amount) VALUES ('000001.SZ', '20240102', 10,11,9,10,10,1.0,10000,100000)")
+        db.execute("INSERT INTO daily (ts_code, trade_date, open, high, low, close, pre_close, pct_chg, vol, amount) VALUES ('000001.SZ', '20240103', 10,11,9,10,10,1.0,10000,100000)")
+        db.execute("INSERT INTO daily_basic (ts_code, trade_date, pb, total_mv, circ_mv, turnover_rate) VALUES ('000001.SZ', '20240102', 2.0, 1e6, 5e5, 5.0)")
+        db.execute("INSERT INTO daily_basic (ts_code, trade_date, pb, total_mv, circ_mv, turnover_rate) VALUES ('000001.SZ', '20240103', 2.0, 1e6, 5e5, 5.0)")
+        db.close()
+
+        result = fill_missing_dates("20240101", "20240105", db_path=tmp_db)
+        assert result["daily"] == []
+        assert result["daily_basic"] == []
+
+    def test_returns_dict_with_both_tables(self, tmp_db):
+        """返回字典包含 daily 和 daily_basic 两个 key."""
+        init_tables(db_path=tmp_db)
+        db = duckdb.connect(tmp_db)
+        db.execute("INSERT INTO trade_cal VALUES ('20240102', 1, 'SSE')")
+        db.execute("INSERT INTO daily (ts_code, trade_date, open, high, low, close, pre_close, pct_chg, vol, amount) VALUES ('000001.SZ', '20240102', 10,11,9,10,10,1.0,10000,100000)")
+        db.execute("INSERT INTO daily_basic (ts_code, trade_date, pb, total_mv, circ_mv, turnover_rate) VALUES ('000001.SZ', '20240102', 2.0, 1e6, 5e5, 5.0)")
+        db.close()
+
+        result = fill_missing_dates("20240101", "20240105", db_path=tmp_db)
+        assert "daily" in result
+        assert "daily_basic" in result
+        assert isinstance(result["daily"], list)
+        assert isinstance(result["daily_basic"], list)
